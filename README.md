@@ -16,15 +16,16 @@ go build
 
 ## Keys - Main Menu
 
-Use the arrow keys to navigate, hit Enter to make a selection
+Use the arrow keys to navigate, hit Enter to make a selection. Use `b` to exit program.
 
 ## Keys - Tables
 
 - `r` - refresh data
-- `j` - move up a row
-- `k` - move down a row
-- `j` - move left a column
+- `k` - move up a row
+- `j` - move down a row
+- `h` - move left a column
 - `l` - move right a column
 - `n` - go to next page
 - `p` - go to previous page
 - `enter` - start editing cell (`esc` to back out, `enter` to `PATCH` data
+- `b` - back to main screen

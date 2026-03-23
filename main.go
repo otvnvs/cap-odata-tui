@@ -449,7 +449,7 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.skip -= pageSize
 				m.fetch()
 			}
-		case "i": // row up
+		case "k": // row up
 			if m.selRow > 0 {
 				m.selRow--
 			} else if m.skip >= pageSize {
@@ -457,7 +457,7 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fetch()
 				m.selRow = len(m.rows) - 1
 			}
-		case "k": // row down
+		case "j": // row down
 			if m.selRow < len(m.rows)-1 {
 				m.selRow++
 			} else if len(m.rows) == pageSize {
@@ -465,7 +465,7 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.fetch()
 				m.selRow = 0
 			}
-		case "j": // col left
+		case "h": // col left
 			if m.selCol > 0 {
 				m.selCol--
 				m.panToCol()
@@ -514,7 +514,7 @@ func (m pagerModel) View() string {
 		}
 		sb.WriteString(hintStyle.Render(fmt.Sprintf("  EDIT [%s]  Enter=save  Esc=cancel", col)))
 	} else {
-		sb.WriteString(hintStyle.Render("  [n/p] page  [r] refresh  [b] back  [i/k] row ↑/↓  [j/l] col ←/→  [Enter] edit"))
+		sb.WriteString(hintStyle.Render("  [n/p] page  [r] refresh  [b] back  [j/k] row ↑/↓  [h/l] col ←/→  [Enter] edit"))
 	}
 	sb.WriteString("\n\n")
 
