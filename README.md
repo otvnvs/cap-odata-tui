@@ -27,4 +27,4 @@ Use the arrow keys to navigate, hit Enter to make a selection
 - `l` - move right a column
 - `n` - go to next page
 - `p` - go to previous page
-- `enter` - start editing cell (`esc` to back out`, `enter` to `PATCH` data
+- `enter` - start editing cell (`esc` to back out, `enter` to `PATCH` data
