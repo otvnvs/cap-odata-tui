@@ -20,6 +20,7 @@ Use the arrow keys to navigate, hit Enter to make a selection
 
 ## Keys - Tables
 
+- `r` - refresh data
 - `j` - move up a row
 - `k` - move down a row
 - `j` - move left a column
