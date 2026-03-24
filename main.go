@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	neturl "net/url"
 	"sort"
 	"strings"
 	"time"
@@ -37,7 +38,17 @@ type Edmx struct {
 	DataServices DataServices `xml:"DataServices"`
 }
 type DataServices struct{ Schemas []Schema `xml:"Schema"` }
-type Schema struct{ EntityTypes []EntityType `xml:"EntityType"` }
+type Schema struct {
+	EntityTypes      []EntityType      `xml:"EntityType"`
+	EntityContainers []EntityContainer `xml:"EntityContainer"`
+}
+type EntityContainer struct {
+	EntitySets []EntitySet `xml:"EntitySet"`
+}
+type EntitySet struct {
+	Name       string `xml:"Name,attr"`
+	EntityType string `xml:"EntityType,attr"` // e.g. "ODataDemo.Product" or "Product"
+}
 type EntityType struct {
 	Name       string     `xml:"Name,attr"`
 	Key        EntityKey  `xml:"Key"`
@@ -59,8 +70,26 @@ type ODataResponse struct {
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
+// get fetches a URL with no special Accept header — used for $metadata XML
+// and HTML landing pages where the server's default format is correct.
 func get(url string) ([]byte, error) {
 	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// getJSON fetches a URL requesting JSON — used for all OData entity/collection
+// requests so servers that default to XML or AtomPub return JSON instead.
+func getJSON(url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -74,6 +103,7 @@ func patch(url string, body []byte) (int, []byte, error) {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -89,6 +119,7 @@ func post(url string, body []byte) (int, []byte, error) {
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -165,25 +196,56 @@ func parseMetadata(body []byte) map[string]entityMeta {
 	return result
 }
 
-func parseEntityNames(body []byte) []string {
-	var names []string
+// entitySetInfo holds the URL-path name and the bare EntityType name for a set.
+type entitySetInfo struct {
+	setName  string // used in URL, e.g. "Products"
+	typeName string // used to look up metadata, e.g. "Product"
+}
+
+// parseEntitySets returns EntitySet definitions from the metadata.
+// Falls back to EntityType names (as both set and type name) when no
+// EntityContainer is defined — which is the case for CAP-generated metadata.
+func parseEntitySets(body []byte) []entitySetInfo {
+	var infos []entitySetInfo
 	var edmx Edmx
 	if err := xml.Unmarshal(body, &edmx); err == nil {
 		for _, schema := range edmx.DataServices.Schemas {
-			for _, et := range schema.EntityTypes {
-				if et.Name != "" {
-					names = append(names, et.Name)
+			for _, ec := range schema.EntityContainers {
+				for _, es := range ec.EntitySets {
+					if es.Name == "" {
+						continue
+					}
+					// EntityType attr is usually "Namespace.TypeName"; strip namespace.
+					typeName := es.EntityType
+					if dot := strings.LastIndex(typeName, "."); dot >= 0 {
+						typeName = typeName[dot+1:]
+					}
+					infos = append(infos, entitySetInfo{setName: es.Name, typeName: typeName})
 				}
 			}
 		}
 	}
-	if len(names) == 0 {
-		re := regexp.MustCompile(`(?i)<EntityType[^>]+Name="([^"]+)"`)
-		for _, m := range re.FindAllSubmatch(body, -1) {
-			names = append(names, string(m[1]))
+	// Fallback: no EntityContainer found — use EntityType names directly.
+	// CAP metadata typically has no EntityContainer or uses type name == set name.
+	if len(infos) == 0 {
+		if err := xml.Unmarshal(body, &edmx); err == nil {
+			for _, schema := range edmx.DataServices.Schemas {
+				for _, et := range schema.EntityTypes {
+					if et.Name != "" {
+						infos = append(infos, entitySetInfo{setName: et.Name, typeName: et.Name})
+					}
+				}
+			}
 		}
 	}
-	return names
+	// Last resort regex fallback
+	if len(infos) == 0 {
+		re := regexp.MustCompile(`(?i)<EntitySet[^>]+Name="([^"]+)"[^>]+EntityType="[^."]*\.?([^"]+)"`)
+		for _, m := range re.FindAllSubmatch(body, -1) {
+			infos = append(infos, entitySetInfo{setName: string(m[1]), typeName: string(m[2])})
+		}
+	}
+	return infos
 }
 
 // ── Entity loading ────────────────────────────────────────────────────────────
@@ -195,35 +257,188 @@ type EntityEntry struct {
 	Meta        entityMeta
 }
 
-func loadEntities() ([]EntityEntry, error) {
-	body, err := get(baseURL + "/")
+// entriesFromMetadata builds EntityEntry list given a known metadataURL and
+// the serviceBase URL (entity sets live at serviceBase/<EntityName>).
+func entriesFromMetadata(metadataURL, serviceBase string) ([]EntityEntry, error) {
+	metaBody, err := get(metadataURL)
 	if err != nil {
-		return nil, fmt.Errorf("could not reach %s: %w", baseURL, err)
+		return nil, fmt.Errorf("could not fetch metadata from %s: %w", metadataURL, err)
+	}
+	sets := parseEntitySets(metaBody)
+	if len(sets) == 0 {
+		return nil, fmt.Errorf("no EntitySet definitions found in metadata at %s", metadataURL)
+	}
+	metas := parseMetadata(metaBody)
+	label := lastPathSegment(serviceBase)
+	var entries []EntityEntry
+	for _, s := range sets {
+		entityURL := strings.TrimSuffix(serviceBase, "/") + "/" + s.setName
+		entries = append(entries, EntityEntry{
+			DisplayName: label + " › " + s.setName,
+			URL:         entityURL,
+			EntityName:  s.setName,
+			Meta:        metas[s.typeName], // key/type info lives on the EntityType
+		})
+	}
+	return entries, nil
+}
+
+// lastPathSegment returns the final non-empty path segment of a URL string.
+func lastPathSegment(u string) string {
+	u = strings.TrimSuffix(u, "/")
+	if idx := strings.LastIndex(u, "/"); idx >= 0 {
+		return u[idx+1:]
+	}
+	return u
+}
+
+// loadFromMetadataURL handles a URL that ends with /$metadata.
+// The service base is derived by stripping /$metadata.
+func loadFromMetadataURL(rawURL string) ([]EntityEntry, error) {
+	serviceBase := strings.TrimSuffix(rawURL, "/$metadata")
+	// Update the global baseURL to the HTTP origin so PATCH/POST/DELETE work.
+	if parsed, err := neturl.Parse(rawURL); err == nil {
+		baseURL = parsed.Scheme + "://" + parsed.Host
+	}
+	return entriesFromMetadata(rawURL, serviceBase)
+}
+
+// odataServiceDoc is the JSON shape of an OData v4 service document.
+type odataServiceDoc struct {
+	Context string `json:"@odata.context"`
+	Value   []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+		Kind string `json:"kind"`
+	} `json:"value"`
+}
+
+// loadFromServiceDocument handles a standard OData v4 service document URL.
+// The document lists entity sets by name and relative URL.
+func loadFromServiceDocument(rawURL string, body []byte) ([]EntityEntry, error) {
+	var doc odataServiceDoc
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("could not parse service document: %w", err)
+	}
+	serviceBase := strings.TrimSuffix(rawURL, "/")
+	metadataURL := serviceBase + "/$metadata"
+	metaBody, err := get(metadataURL)
+	if err != nil {
+		return nil, fmt.Errorf("could not fetch $metadata: %w", err)
+	}
+	metas := parseMetadata(metaBody)
+
+	// Update global baseURL to origin.
+	if parsed, err := neturl.Parse(rawURL); err == nil {
+		baseURL = parsed.Scheme + "://" + parsed.Host
+	}
+
+	label := lastPathSegment(serviceBase)
+	var entries []EntityEntry
+	for _, item := range doc.Value {
+		if item.Kind != "" && item.Kind != "EntitySet" {
+			continue // skip function imports, singletons, etc.
+		}
+		name := item.Name
+		entityURL := serviceBase + "/" + strings.TrimPrefix(item.URL, "/")
+		entries = append(entries, EntityEntry{
+			DisplayName: label + " › " + name,
+			URL:         entityURL,
+			EntityName:  name,
+			Meta:        metas[name],
+		})
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("service document at %s contained no EntitySet entries", rawURL)
+	}
+	return entries, nil
+}
+
+// loadFromCAPLandingPage handles a CAP service root URL whose index page is
+// an HTML page with links to individual /$metadata documents.
+func loadFromCAPLandingPage(rawURL string) ([]EntityEntry, error) {
+	body, err := get(rawURL + "/")
+	if err != nil {
+		return nil, fmt.Errorf("could not reach %s: %w", rawURL, err)
 	}
 	metadataLinks := scrapeMetadataLinks(body)
 	if len(metadataLinks) == 0 {
-		return nil, fmt.Errorf("no $metadata links found on the index page")
+		return nil, fmt.Errorf("no $metadata links found on the CAP landing page at %s", rawURL)
 	}
 	var entries []EntityEntry
 	for _, link := range metadataLinks {
 		serviceBase := strings.TrimSuffix(link, "/$metadata")
-		metaBody, err := get(baseURL + link)
+		metaBody, err := get(rawURL + link)
 		if err != nil {
 			continue
 		}
 		metas := parseMetadata(metaBody)
-		for _, name := range parseEntityNames(metaBody) {
-			url := baseURL + serviceBase + "/" + name
-			display := strings.TrimPrefix(serviceBase, "/") + " › " + name
+		for _, s := range parseEntitySets(metaBody) {
+			entityURL := rawURL + serviceBase + "/" + s.setName
+			display := strings.TrimPrefix(serviceBase, "/") + " › " + s.setName
 			entries = append(entries, EntityEntry{
 				DisplayName: display,
-				URL:         url,
-				EntityName:  name,
-				Meta:        metas[name],
+				URL:         entityURL,
+				EntityName:  s.setName,
+				Meta:        metas[s.typeName],
 			})
 		}
 	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("no entities found via CAP landing page at %s", rawURL)
+	}
 	return entries, nil
+}
+
+// discoverMode identifies how a given URL should be handled.
+type discoverMode int
+
+const (
+	modeMetadataURL     discoverMode = iota // ends with /$metadata
+	modeServiceDocument                     // OData JSON service document
+	modeCAPLandingPage                      // CAP HTML landing page (fallback)
+)
+
+// detectMode probes the URL and returns the appropriate discovery mode.
+func detectMode(rawURL string) (discoverMode, []byte, error) {
+	// 1. Explicit $metadata URL
+	if strings.HasSuffix(strings.TrimSuffix(rawURL, "/"), "$metadata") {
+		return modeMetadataURL, nil, nil
+	}
+	// 2. Fetch and inspect
+	// Try JSON first (service document detection), fall back to plain get (CAP HTML)
+	body, err := getJSON(rawURL)
+	if err != nil {
+		body, err = getJSON(rawURL + "/")
+		if err != nil {
+			return 0, nil, fmt.Errorf("could not reach %s: %w", rawURL, err)
+		}
+	}
+	// Check for OData JSON service document
+	var doc odataServiceDoc
+	if err := json.Unmarshal(body, &doc); err == nil {
+		if doc.Context != "" || len(doc.Value) > 0 {
+			return modeServiceDocument, body, nil
+		}
+	}
+	// Default: assume CAP HTML landing page
+	return modeCAPLandingPage, body, nil
+}
+
+// loadEntities auto-detects the URL type and loads entities accordingly.
+func loadEntities() ([]EntityEntry, error) {
+	mode, body, err := detectMode(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	switch mode {
+	case modeMetadataURL:
+		return loadFromMetadataURL(baseURL)
+	case modeServiceDocument:
+		return loadFromServiceDocument(baseURL, body)
+	default:
+		return loadFromCAPLandingPage(baseURL)
+	}
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -248,6 +463,7 @@ const (
 	modeNav    pagerMode = iota
 	modeEdit             // editing a single cell (PATCH)
 	modeInsert           // insert-form: filling fields for a new entity (POST)
+	modeSearch           // typing a search filter for the active column
 )
 
 // ── Pager model ───────────────────────────────────────────────────────────────
@@ -279,18 +495,34 @@ type pagerModel struct {
 	statusErr    bool
 	insertFields []insertField // fields for insert form
 	insertSel    int           // selected field index in insert form
-	autoRefresh  bool          // whether auto-refresh is active
+	autoRefresh    bool              // whether auto-refresh is active
+	columnFilters  map[string]string // active OData contains() filter per column
+	searchBuf      []rune            // buffer while typing a search term
+	searchOff      int               // viewport offset for search input
 }
 
 func newPager(e EntityEntry) pagerModel {
-	m := pagerModel{entity: e, winCols: 120, winRows: 40}
+	m := pagerModel{entity: e, winCols: 120, winRows: 40, columnFilters: map[string]string{}}
 	m.fetch()
 	return m
 }
 
 func (m *pagerModel) fetch() {
 	url := fmt.Sprintf("%s?$top=%d&$skip=%d", m.entity.URL, pageSize, m.skip)
-	body, err := get(url)
+	// Append OData $filter clauses for each active column search
+	if len(m.columnFilters) > 0 {
+		var clauses []string
+		for col, term := range m.columnFilters {
+			if term != "" {
+				clauses = append(clauses, fmt.Sprintf("contains(%s, '%s')", col, strings.ReplaceAll(term, "'", "''")))
+			}
+		}
+		if len(clauses) > 0 {
+			sort.Strings(clauses) // stable order
+			url += "&$filter=" + strings.ReplaceAll(neturl.QueryEscape(strings.Join(clauses, " and ")), "+", "%20")
+		}
+	}
+	body, err := getJSON(url)
 	if err != nil {
 		m.fetchErr = err.Error()
 		return
@@ -301,11 +533,14 @@ func (m *pagerModel) fetch() {
 		return
 	}
 	m.fetchErr = ""
-	m.header = nil
 	m.rows = nil
 	if len(resp.Value) == 0 {
+		// Keep m.header from the last successful fetch so the column
+		// headers (and search boxes) remain visible when filters return
+		// no results.
 		return
 	}
+	m.header = nil
 	for k := range resp.Value[0] {
 		m.header = append(m.header, k)
 	}
@@ -414,7 +649,7 @@ func (m *pagerModel) deleteEntity() {
 		m.statusErr = true
 		return
 	}
-	m.statusMsg = "• Entity deleted"
+	m.statusMsg = "✓ Entity deleted"
 	m.statusErr = false
 	// Clamp cursor then re-fetch so the deleted row disappears
 	if m.selRow > 0 {
@@ -467,7 +702,7 @@ func (m *pagerModel) commitInsert() {
 		m.mode = modeNav
 		return
 	}
-	m.statusMsg = "• Entity inserted"
+	m.statusMsg = "✓ Entity inserted"
 	m.statusErr = false
 	m.mode = modeNav
 	m.fetch()
@@ -512,7 +747,7 @@ func (m *pagerModel) commitEdit() {
 
 	// Success — optimistically update cell then re-fetch to stay in sync
 	m.rows[m.selRow][m.selCol] = newVal
-	m.statusMsg = fmt.Sprintf("• %s updated", col)
+	m.statusMsg = fmt.Sprintf("✓ %s updated", col)
 	m.statusErr = false
 	m.mode = modeNav
 	m.fetch()
@@ -630,6 +865,36 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// ── search mode ──────────────────────────────────────────────
+		if m.mode == modeSearch {
+			switch msg.String() {
+			case "enter", "esc":
+				// Commit: apply filter if buffer non-empty, clear if empty
+				col := m.header[m.selCol]
+				term := strings.TrimSpace(string(m.searchBuf))
+				if term == "" {
+					delete(m.columnFilters, col)
+				} else {
+					m.columnFilters[col] = term
+				}
+				m.skip = 0
+				m.selRow = 0
+				m.mode = modeNav
+				m.fetch()
+			case "ctrl+c":
+				os.Exit(0)
+			case "backspace":
+				if len(m.searchBuf) > 0 {
+					m.searchBuf = m.searchBuf[:len(m.searchBuf)-1]
+				}
+			default:
+				if r := []rune(msg.String()); len(r) == 1 && r[0] >= 32 {
+					m.searchBuf = append(m.searchBuf, r[0])
+				}
+			}
+			return m, nil
+		}
+
 		// ── nav mode ──────────────────────────────────────────────────
 		switch msg.String() {
 		case "enter":
@@ -681,9 +946,17 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selCol++
 				m.panToCol()
 			}
-                case "r"://refresh once
-                        m.fetch()
-		case "R"://refresh in loop
+		case "/":
+			if len(m.header) > 0 {
+				col := m.header[m.selCol]
+				// Seed search buffer with existing filter for this column (if any)
+				m.searchBuf = []rune(m.columnFilters[col])
+				m.searchOff = 0
+				m.mode = modeSearch
+			}
+		case "r":
+			m.fetch()
+		case "R":
 			m.autoRefresh = !m.autoRefresh
 			if m.autoRefresh {
 				m.fetch() // immediate refresh when turning on
@@ -775,8 +1048,14 @@ func (m pagerModel) View() string {
 		sb.WriteString(hintStyle.Render(fmt.Sprintf("  EDIT [%s]  Enter=save  Esc=cancel", col)))
 	case modeInsert:
 		sb.WriteString(hintStyle.Render("  INSERT  j/k=field ↑/↓  Enter=edit field  s=submit  b/Esc=cancel"))
+	case modeSearch:
+		col := ""
+		if m.selCol < len(m.header) {
+			col = m.header[m.selCol]
+		}
+		sb.WriteString(hintStyle.Render(fmt.Sprintf("  SEARCH [%s]  Enter=apply  Esc=apply  Backspace=clear  (empty=remove filter)", col)))
 	default:
-		sb.WriteString(hintStyle.Render("  [n/p] page  [r] refresh  [R] auto refresh [b] back  [j/k] row ↑/↓  [h/l] col ←/→  [Enter] edit  [i] insert  [x] delete"))
+		sb.WriteString(hintStyle.Render("  [n/p] next/prev  [r] refresh  [R] auto-refresh  [/] search col  [b] back  [j/k] row ↑/↓  [h/l] col ←/→  [Enter] edit  [i] insert  [x] delete"))
 	}
 	sb.WriteString("\n\n")
 
@@ -826,21 +1105,46 @@ func (m pagerModel) View() string {
 		sb.WriteString(errStyle.Render("Error: " + m.fetchErr))
 		return sb.String()
 	}
-	if len(m.rows) == 0 {
-		sb.WriteString(hintStyle.Render("--- No data ---"))
-		return sb.String()
-	}
 
 	vis := m.visibleCols()
 	end := imin(m.colOff+vis, len(m.header))
 	visHeaders := m.header[m.colOff:end]
 
-	// header row
+	// ── search filter row (above column headers) ────────────────────────────
+	for ci := range visHeaders {
+		absCI := m.colOff + ci
+		col := m.header[absCI]
+		var searchCell string
+		if m.mode == modeSearch && absCI == m.selCol {
+			// Active search input: show live buffer with cursor
+			searchCell = editViewport(m.searchBuf, &m.searchOff, colWidth)
+			sb.WriteString(editStyle.Render(searchCell))
+		} else if term, ok := m.columnFilters[col]; ok && term != "" {
+			// Column has an active filter: show it dimmed
+			searchCell = padOrTrunc("/"+term, colWidth)
+			sb.WriteString(hintStyle.Render(searchCell))
+		} else {
+			// No filter: blank placeholder
+			sb.WriteString(strings.Repeat(" ", colWidth))
+		}
+		sb.WriteString("  ")
+	}
+	sb.WriteString("\n")
+
+	// ── column header row ────────────────────────────────────────────────────
 	for ci, h := range visHeaders {
 		absCI := m.colOff + ci
-		cell := padOrTrunc(h, colWidth)
+		col := m.header[absCI]
+		_, hasFilter := m.columnFilters[col]
+		label := h
+		if hasFilter {
+			label = "▼ " + h
+		}
+		cell := padOrTrunc(label, colWidth)
 		if absCI == m.selCol {
 			sb.WriteString(selColStyle.Render(cell))
+		} else if hasFilter {
+			sb.WriteString(colHdrStyle.Render(cell))
 		} else {
 			sb.WriteString(colHdrStyle.Render(cell))
 		}
@@ -856,6 +1160,13 @@ func (m pagerModel) View() string {
 	sb.WriteString("\n")
 
 	// data rows
+	if len(m.rows) == 0 {
+		sb.WriteString(hintStyle.Render("  --- no results"))
+		if len(m.columnFilters) > 0 {
+			sb.WriteString(hintStyle.Render("  (filters active — press / on a column to edit or clear)"))
+		}
+		sb.WriteString("\n")
+	}
 	for ri, row := range m.rows {
 		for ci := range visHeaders {
 			absCI := m.colOff + ci
@@ -909,6 +1220,9 @@ func (m pagerModel) View() string {
 		cellVal := m.rows[m.selRow][m.selCol]
 		col := m.header[m.selCol]
 		maxDetail := m.winCols - len(col) - 12
+		if m.autoRefresh {
+			maxDetail -= 20 // reserve space for the indicator
+		}
 		if maxDetail < 10 {
 			maxDetail = 10
 		}
@@ -917,19 +1231,17 @@ func (m pagerModel) View() string {
 		if len(r) > maxDetail {
 			display = midTrunc(cellVal, maxDetail)
 		}
+		var line string
 		if len(m.header) > vis {
-			sb.WriteString(hintStyle.Render(fmt.Sprintf(
-				"  cols %d–%d of %d  │  %s: %s",
-				m.colOff+1, end, len(m.header), col, display,
-			)))
+			line = fmt.Sprintf("  cols %d–%d of %d  │  %s: %s", m.colOff+1, end, len(m.header), col, display)
 		} else {
-			sb.WriteString(hintStyle.Render(fmt.Sprintf("  %s: %s", col, display)))
+			line = fmt.Sprintf("  %s: %s", col, display)
 		}
-	}
-
-	// indiate auto refresh enabled
-	if m.autoRefresh {
-		sb.WriteString(titleStyle.Render("\n\n  • Auto refresh enabled"))
+		if m.autoRefresh {
+			sb.WriteString(hintStyle.Render(line) + "  │  " + okStyle.Render("• AUTO-REFRESH ON"))
+		} else {
+			sb.WriteString(hintStyle.Render(line))
+		}
 	}
 
 	return sb.String()
@@ -998,7 +1310,7 @@ func (m menuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// SetItems returns a cmd; pass it through so the list can
 			// run its internal filtering/sorting after the update.
 			cmd := m.list.SetItems(items)
-			m.statusMsg = fmt.Sprintf("• Refreshed — %d entities", len(entries))
+			m.statusMsg = fmt.Sprintf("✓ Refreshed — %d entities", len(entries))
 			m.statusErr = false
 			return m, cmd
 
@@ -1058,8 +1370,8 @@ func imin(a, b int) int {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func run(url string) {
-	baseURL = url
-	fmt.Println("Loading OData entities from", baseURL, "…")
+	baseURL = strings.TrimSuffix(url, "/")
+	fmt.Println("Detecting OData service at", baseURL, "…")
 	entries, err := loadEntities()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -1107,9 +1419,12 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "cap_browser [URL]",
 		Short: "Interactive terminal browser for CAP OData services",
-		Long: `cap_browser connects to a SAP CAP OData service, discovers all
-entities from the service metadata, and lets you browse and edit
-them in an interactive terminal UI.
+		Long: `cap_browser is an interactive terminal browser for OData services.
+It auto-detects the type of URL provided and discovers entities accordingly:
+
+  - URL ending in /$metadata   → parsed directly as an OData metadata document
+  - OData v4 service document  → standard JSON service document discovery
+  - CAP landing page           → HTML scrape of the CAP service root (default)
 
 The target URL can be supplied as a positional argument or via the
 --url flag. The positional argument takes priority.
@@ -1121,7 +1436,8 @@ Key bindings (pager):
   Enter        edit selected cell  (PATCH on save)
   i            insert new entity  (POST form)
   x            delete selected entity  (DELETE, immediate)
-  r            toggle refresh
+  /            search active column (fuzzy contains, Enter to apply)
+  r            refresh current page
   R            toggle auto-refresh (1 s interval; pauses during edit/insert)
   b / Esc      back to entity menu
 
@@ -1155,3 +1471,4 @@ Key bindings (menu):
 		os.Exit(1)
 	}
 }
+

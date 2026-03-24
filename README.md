@@ -8,6 +8,12 @@
 go build
 ```
 
+Or
+
+```bash
+GOOS=windows GOARCH=amd64 go build -o cap_browser.exe
+```
+
 ## Usage
 
 ```bash
@@ -25,6 +31,8 @@ go build
 ```bash
 ./cap_browser -url http://localhost:4005
 ```
+
+The `-url` flag value can be either a CAP service document url or a `$metadata` url
 
 ## Keys - Main Menu
 
