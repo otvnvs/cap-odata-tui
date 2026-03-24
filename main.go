@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -27,6 +28,7 @@ var baseURL = "http://localhost:4004"
 
 const pageSize = 10
 const colWidth = 20
+const refreshInterval = time.Second
 
 // ── OData XML structs ─────────────────────────────────────────────────────────
 
@@ -277,6 +279,7 @@ type pagerModel struct {
 	statusErr    bool
 	insertFields []insertField // fields for insert form
 	insertSel    int           // selected field index in insert form
+	autoRefresh  bool          // whether auto-refresh is active
 }
 
 func newPager(e EntityEntry) pagerModel {
@@ -411,7 +414,7 @@ func (m *pagerModel) deleteEntity() {
 		m.statusErr = true
 		return
 	}
-	m.statusMsg = "✓ Entity deleted"
+	m.statusMsg = "• Entity deleted"
 	m.statusErr = false
 	// Clamp cursor then re-fetch so the deleted row disappears
 	if m.selRow > 0 {
@@ -464,7 +467,7 @@ func (m *pagerModel) commitInsert() {
 		m.mode = modeNav
 		return
 	}
-	m.statusMsg = "✓ Entity inserted"
+	m.statusMsg = "• Entity inserted"
 	m.statusErr = false
 	m.mode = modeNav
 	m.fetch()
@@ -509,7 +512,7 @@ func (m *pagerModel) commitEdit() {
 
 	// Success — optimistically update cell then re-fetch to stay in sync
 	m.rows[m.selRow][m.selCol] = newVal
-	m.statusMsg = fmt.Sprintf("✓ %s updated", col)
+	m.statusMsg = fmt.Sprintf("• %s updated", col)
 	m.statusErr = false
 	m.mode = modeNav
 	m.fetch()
@@ -532,13 +535,35 @@ func (m *pagerModel) panToCol() {
 	}
 }
 
-func (m pagerModel) Init() tea.Cmd { return nil }
+// tickMsg is sent by the auto-refresh timer.
+type tickMsg time.Time
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func (m pagerModel) Init() tea.Cmd {
+	if m.autoRefresh {
+		return tickCmd()
+	}
+	return nil
+}
 
 func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.winCols = msg.Width
 		m.winRows = msg.Height
+
+	case tickMsg:
+		// Only refresh in nav mode so we don't disrupt active edits or inserts.
+		if m.mode == modeNav {
+			m.fetch()
+		}
+		if m.autoRefresh {
+			return m, tickCmd()
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		// ── cell edit mode ────────────────────────────────────────────
@@ -656,8 +681,14 @@ func (m pagerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selCol++
 				m.panToCol()
 			}
-		case "r":
-			m.fetch()
+                case "r"://refresh once
+                        m.fetch()
+		case "R"://refresh in loop
+			m.autoRefresh = !m.autoRefresh
+			if m.autoRefresh {
+				m.fetch() // immediate refresh when turning on
+				return m, tickCmd()
+			}
 		case "b", "esc":
 			m.done = true
 			return m, tea.Quit
@@ -745,7 +776,7 @@ func (m pagerModel) View() string {
 	case modeInsert:
 		sb.WriteString(hintStyle.Render("  INSERT  j/k=field ↑/↓  Enter=edit field  s=submit  b/Esc=cancel"))
 	default:
-		sb.WriteString(hintStyle.Render("  [n/p] page  [r] refresh  [b] back  [j/k] row ↑/↓  [h/l] col ←/→  [Enter] edit  [i] insert  [x] delete"))
+		sb.WriteString(hintStyle.Render("  [n/p] page  [r] refresh  [R] auto refresh [b] back  [j/k] row ↑/↓  [h/l] col ←/→  [Enter] edit  [i] insert  [x] delete"))
 	}
 	sb.WriteString("\n\n")
 
@@ -896,6 +927,11 @@ func (m pagerModel) View() string {
 		}
 	}
 
+	// indiate auto refresh enabled
+	if m.autoRefresh {
+		sb.WriteString(titleStyle.Render("\n\n  • Auto refresh enabled"))
+	}
+
 	return sb.String()
 }
 
@@ -962,7 +998,7 @@ func (m menuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// SetItems returns a cmd; pass it through so the list can
 			// run its internal filtering/sorting after the update.
 			cmd := m.list.SetItems(items)
-			m.statusMsg = fmt.Sprintf("✓ Refreshed — %d entities", len(entries))
+			m.statusMsg = fmt.Sprintf("• Refreshed — %d entities", len(entries))
 			m.statusErr = false
 			return m, cmd
 
@@ -1085,7 +1121,8 @@ Key bindings (pager):
   Enter        edit selected cell  (PATCH on save)
   i            insert new entity  (POST form)
   x            delete selected entity  (DELETE, immediate)
-  r            refresh current page
+  r            toggle refresh
+  R            toggle auto-refresh (1 s interval; pauses during edit/insert)
   b / Esc      back to entity menu
 
 Key bindings (menu):

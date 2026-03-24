@@ -42,4 +42,5 @@ Use the arrow keys to navigate, hit Enter to make a selection. Use `b` to exit p
 - `enter` - start editing cell (`esc` to back out, `enter` to `PATCH` data
 - 'i' - insert new row
 - 'x' - delete row
+- 'r' - toggle auto refresh
 - `b` - back to main screen
