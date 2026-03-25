@@ -25,7 +25,8 @@ import (
 // Version is set at build time via -ldflags "-X main.version=x.y.z"
 var version = "dev"
 
-var baseURL = "http://localhost:4004"
+var baseURL = "http://localhost:4004"  // HTTP origin, used for PATCH/POST/DELETE
+var serviceURL = "http://localhost:4004" // original input URL, used for re-discovery on refresh
 
 const pageSize = 10
 const colWidth = 20
@@ -426,18 +427,20 @@ func detectMode(rawURL string) (discoverMode, []byte, error) {
 }
 
 // loadEntities auto-detects the URL type and loads entities accordingly.
+// Always uses serviceURL (the original input) so refresh works correctly
+// even after baseURL has been refined to just the HTTP origin.
 func loadEntities() ([]EntityEntry, error) {
-	mode, body, err := detectMode(baseURL)
+	mode, body, err := detectMode(serviceURL)
 	if err != nil {
 		return nil, err
 	}
 	switch mode {
 	case modeMetadataURL:
-		return loadFromMetadataURL(baseURL)
+		return loadFromMetadataURL(serviceURL)
 	case modeServiceDocument:
-		return loadFromServiceDocument(baseURL, body)
+		return loadFromServiceDocument(serviceURL, body)
 	default:
-		return loadFromCAPLandingPage(baseURL)
+		return loadFromCAPLandingPage(serviceURL)
 	}
 }
 
@@ -514,7 +517,7 @@ func (m *pagerModel) fetch() {
 		var clauses []string
 		for col, term := range m.columnFilters {
 			if term != "" {
-				clauses = append(clauses, fmt.Sprintf("contains(%s, '%s')", col, strings.ReplaceAll(term, "'", "''")))
+				clauses = append(clauses, fmt.Sprintf("contains(%s,'%s')", col, strings.ReplaceAll(term, "'", "''")))
 			}
 		}
 		if len(clauses) > 0 {
@@ -1238,7 +1241,7 @@ func (m pagerModel) View() string {
 			line = fmt.Sprintf("  %s: %s", col, display)
 		}
 		if m.autoRefresh {
-			sb.WriteString(hintStyle.Render(line) + "  │  " + okStyle.Render("• AUTO-REFRESH ON"))
+			sb.WriteString(hintStyle.Render(line) + "  │  " + okStyle.Render("⟳ AUTO-REFRESH ON"))
 		} else {
 			sb.WriteString(hintStyle.Render(line))
 		}
@@ -1370,8 +1373,9 @@ func imin(a, b int) int {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func run(url string) {
-	baseURL = strings.TrimSuffix(url, "/")
-	fmt.Println("Detecting OData service at", baseURL, "…")
+	serviceURL = strings.TrimSuffix(url, "/")
+	baseURL = serviceURL // may be refined by loadFromMetadataURL / loadFromServiceDocument
+	fmt.Println("Detecting OData service at", serviceURL, "…")
 	entries, err := loadEntities()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
@@ -1383,8 +1387,10 @@ func run(url string) {
 	}
 	fmt.Printf("Found %d entities.\n\n", len(entries))
 
+	// Build the menu once; reuse it on every return from the pager so
+	// cursor position, filter text, and scroll offset are all preserved.
+	menu := newMenu(entries)
 	for {
-		menu := newMenu(entries)
 		p := tea.NewProgram(menu, tea.WithAltScreen())
 		result, err := p.Run()
 		if err != nil {
@@ -1396,13 +1402,13 @@ func run(url string) {
 			fmt.Println("Goodbye.")
 			return
 		}
-		// Carry updated entries back into the next menu iteration
-		// so a mid-session refresh persists across pager visits.
-		n := m.list.Items()
-		entries = make([]EntityEntry, len(n))
-		for i, it := range n {
-			entries[i] = it.(item).entry
-		}
+
+		// If a refresh happened inside the menu the items may have changed;
+		// carry the live list model forward so those changes are preserved too.
+		menu = m
+		// Clear the selection so re-entering the menu doesn't immediately
+		// re-open the pager.
+		menu.selected = nil
 
 		pager := newPager(*m.selected)
 		p2 := tea.NewProgram(pager, tea.WithAltScreen())
@@ -1471,4 +1477,3 @@ Key bindings (menu):
 		os.Exit(1)
 	}
 }
-
